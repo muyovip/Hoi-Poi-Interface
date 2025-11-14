@@ -1,59 +1,80 @@
 """
 GΛLYPH Expression Merger
 
-Merges 4 LLM GΛLYPH outputs into a single λgame expression.
-Validates all inputs and ensures final expression coherence.
+Merges 4 LLM GΛLYPH outputs into single λgame expression.
+Validates syntax, ensures coherence, and creates final balanced expression.
 """
 
 import re
-from typing import Dict, List, Optional, Tuple, Any
+import logging
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
+import ast
 
-from ..orchestration.game_orchestrator import LLMResponse
-
-
-class MergeError(Exception):
-    """Error during GΛLYPH expression merging"""
-    pass
+logger = logging.getLogger(__name__)
 
 
-class ValidationResult(Enum):
-    VALID = "valid"
-    INVALID_SYNTAX = "invalid_syntax"
-    INVALID_STRUCTURE = "invalid_structure"
-    MISSING_COMPONENTS = "missing_components"
+class MergeStrategy(Enum):
+    """Strategy for merging GΛLYPH expressions"""
+    SIMPLE = "simple"           # Direct combination
+    INTELLIGENT = "intelligent"  # Semantic analysis and merging
+    BALANCED = "balanced"       # Focus on game balance and coherence
 
 
 @dataclass
-class ParsedGlyphComponent:
-    """Parsed GΛLYPH expression component"""
-    component_type: str  # 'narrative', 'mechanics', 'assets', 'balance'
+class GlyphExpression:
+    """Parsed GΛLYPH expression with metadata"""
+    llm_type: str
     raw_expression: str
-    lambda_name: str
-    bindings: List[str]
-    body: str
+    parsed_ast: Optional[Any]
+    variables: List[str]
+    functions: List[str]
+    dependencies: List[str]
     is_valid: bool
-    validation_error: Optional[str] = None
+    confidence: float = 1.0
 
 
 @dataclass
-class MergedGameExpression:
-    """Final merged game expression"""
-    glyph_expression: str
-    components: Dict[str, ParsedGlyphComponent]
-    balance_score: float
-    is_valid: bool
-    validation_result: ValidationResult
-    merge_time: float = 0.0
+class MergeResult:
+    """Result of GΛLYPH expression merging"""
+    success: bool
+    final_expression: str
+    merge_strategy: MergeStrategy
+    component_expressions: Dict[str, str]
+    validation_errors: List[str]
+    merge_score: float
+    processing_time: float
+    metadata: Dict[str, Any]
 
 
 class GlyphMerger:
-    """Merges multiple GΛLYPH expressions into unified game manifest"""
+    """
+    Merges 4 LLM GΛLYPH outputs into single coherent λgame expression.
+
+    Features:
+    - Expression parsing and validation
+    - Dependency analysis and resolution
+    - Variable scoping and conflict resolution
+    - Semantic coherence checking
+    - Balance scoring and optimization
+    """
 
     def __init__(self):
-        self.required_components = ['narrative', 'mechanics', 'assets', 'balance']
-        self.balance_range = (0.0, 1.0)
+        self.glyph_keywords = {
+            'lambda_symbols': ['λ', '\\'],
+            'binding_keywords': ['let', 'in'],
+            'control_keywords': ['if', 'then', 'else', 'match'],
+            'data_keywords': ['tuple', 'list', 'record'],
+            'function_keywords': ['fn', 'func', 'function']
+        }
+
+        self.game_components = {
+            'narrative': ['story', 'setting', 'premise', 'objective', 'narrative'],
+            'mechanics': ['rules', 'mechanics', 'actions', 'transitions', 'logic'],
+            'assets': ['assets', 'visuals', 'items', 'environment', 'graphics'],
+            'balance': ['balance', 'scoring', 'difficulty', 'progression']
+        }
 
     def merge_responses(self, responses: List[LLMResponse]) -> MergedGameExpression:
         """
