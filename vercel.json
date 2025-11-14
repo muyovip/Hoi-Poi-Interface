@@ -2,17 +2,19 @@
   "version": 2,
   "builds": [
     {
-      "src": "dist/**",
+      "src": "capsules/**/*.glyph",
+      "use": "@vercel/static"
+    },
+    {
+      "src": "public/**",
       "use": "@vercel/static"
     }
   ],
   "routes": [
     {
-      "src": "/(.*)",
-      "dest": "/dist/$1"
+      "src": "/capsules/(.*)",
+      "dest": "/capsules/$1"
     }
   ],
-  "env": {
-    "VITE_CAPSULEOS_API": "https://api.capsuleos.com"
-  }
+  "public": true
 }
