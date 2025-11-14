@@ -1,69 +1,142 @@
 """
 Multi-LLM Game Orchestration Engine
 
-Coordinates 4 specialized models with adaptive hybrid processing.
-Manages parallel, sequential, and pipeline execution strategies.
+Coordinates 4 specialized LLMs with adaptive hybrid processing for game generation.
+Orchestrates Phi-3 (narrative), Gemma-2B (mechanics), TinyLlama (assets), Qwen-0.5B (balance).
 """
 
 import asyncio
 import json
-import time
-from typing import Dict, List, Optional, Tuple, Any
+import logging
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, asdict
 from enum import Enum
+import time
+import aiohttp
+from concurrent.futures import TimeoutError
 
-from .text_orchestrator import LLMContext, GameConcepts
+from .text_orchestrator import TextAnalysisResult, LLMContext, OrchestrationStrategy
+
+logger = logging.getLogger(__name__)
 
 
-class ExecutionStrategy(Enum):
-    PARALLEL = "parallel"
-    SEQUENTIAL = "sequential"
-    PIPELINE = "pipeline"
+class LLMType(Enum):
+    NARRATIVE = "narrative"      # Phi-3
+    MECHANICS = "mechanics"      # Gemma-2B
+    ASSETS = "assets"           # TinyLlama
+    BALANCE = "balance"         # Qwen-0.5B
+
+
+@dataclass
+class LLMModel:
+    """Configuration for each LLM"""
+    llm_type: LLMType
+    model_name: str
+    api_endpoint: str
+    max_tokens: int
+    temperature: float
+    timeout: int = 60
 
 
 @dataclass
 class LLMResponse:
-    """Response from an LLM"""
-    llm_type: str
+    """Response from individual LLM"""
+    llm_type: LLMType
+    model_name: str
     raw_response: str
     glyph_expression: str
     is_valid_glyph: bool
-    validation_error: Optional[str] = None
-    execution_time: float = 0.0
-
-
-@dataclass
-class OrchestrationResult:
-    """Result of multi-LLM orchestration"""
-    strategy: ExecutionStrategy
-    responses: List[LLMResponse]
-    total_time: float
-    success: bool
+    response_time: float
+    token_usage: int
     error: Optional[str] = None
 
 
+@dataclass
+class GameGenerationRequest:
+    """Request for game generation"""
+    request_id: str
+    text_analysis: TextAnalysisResult
+    user_id: Optional[str] = None
+    parent_cid: Optional[str] = None
+    created_at: float = None
+
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = time.time()
+
+
+@dataclass
+class GameGenerationResult:
+    """Result of game generation process"""
+    request_id: str
+    success: bool
+    final_glyph_expression: str
+    llm_responses: Dict[LLMType, LLMResponse]
+    generation_time: float
+    strategy_used: OrchestrationStrategy
+    error: Optional[str] = None
+    metadata: Dict[str, Any] = None
+
+
 class GameOrchestrator:
-    """Orchestrates multi-LLM game generation with adaptive strategies"""
+    """
+    Coordinates 4 specialized LLMs for game generation using adaptive hybrid processing.
 
-    def __init__(self, llm_configs: Dict[str, Dict[str, Any]]):
-        """
-        Initialize orchestrator with LLM configurations
+    Features:
+    - Adaptive routing (parallel, sequential, pipeline) based on input complexity
+    - Individual model timeout and retry handling
+    - GΛLYPH expression validation for each response
+    - Performance monitoring and metrics collection
+    """
 
-        Args:
-            llm_configs: Dictionary mapping LLM types to their configurations
-        """
-        self.llm_configs = llm_configs
-        self.max_retries = 3
-        self.retry_delay = 1.0
+    def __init__(self, vllm_api_url: str = "http://localhost:8000"):
+        self.vllm_api_url = vllm_api_url.rstrip('/')
 
-        # LLM priority for pipeline execution
-        self.pipeline_order = ['narrative', 'mechanics', 'assets', 'balance']
+        # Initialize LLM configurations
+        self.models = {
+            LLMType.NARRATIVE: LLMModel(
+                llm_type=LLMType.NARRATIVE,
+                model_name="microsoft/Phi-3-mini-4k-instruct",
+                api_endpoint="/v1/chat/completions",
+                max_tokens=800,
+                temperature=0.8,
+                timeout=45
+            ),
+            LLMType.MECHANICS: LLMModel(
+                llm_type=LLMType.MECHANICS,
+                model_name="google/gemma-2b-it",
+                api_endpoint="/v1/chat/completions",
+                max_tokens=1000,
+                temperature=0.6,
+                timeout=60
+            ),
+            LLMType.ASSETS: LLMModel(
+                llm_type=LLMType.ASSETS,
+                model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                api_endpoint="/v1/chat/completions",
+                max_tokens=600,
+                temperature=0.7,
+                timeout=45
+            ),
+            LLMType.BALANCE: LLMModel(
+                llm_type=LLMType.BALANCE,
+                model_name="Qwen/Qwen1.5-0.5B-Chat",
+                api_endpoint="/v1/chat/completions",
+                max_tokens=1200,
+                temperature=0.5,
+                timeout=90
+            )
+        }
 
-        # Validate required LLMs are present
-        required_llms = ['narrative', 'mechanics', 'assets', 'balance']
-        for llm_type in required_llms:
-            if llm_type not in llm_configs:
-                raise ValueError(f"Missing required LLM config: {llm_type}")
+        # Performance tracking
+        self.active_requests: Dict[str, GameGenerationRequest] = {}
+        self.generation_metrics = {
+            "total_requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "average_generation_time": 0.0,
+            "llm_response_times": {llm_type: [] for llm_type in LLMType}
+        }
 
     async def orchestrate_generation(
         self,
