@@ -361,6 +361,103 @@ def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
 
 
+# Game Generation Endpoints
+@router.post(
+    "/v1/game/generate",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+async def generate_game(request: dict, raw_request: Request):
+    """Generate a new game from text input"""
+    handler = game_server(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(
+            message="Game generation service not available"
+        )
+
+    try:
+        from vllm.entrypoints.openai.game_server import GameGenerateRequest
+        gen_request = GameGenerateRequest(**request)
+        return await handler.create_game_generation(gen_request, raw_request)
+    except Exception as e:
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)
+        ) from e
+
+
+@router.get("/v1/game/{cid}")
+async def get_game(cid: str, raw_request: Request):
+    """Retrieve a game by CID"""
+    handler = game_server(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(
+            message="Game service not available"
+        )
+
+    try:
+        return await handler.get_game(cid, raw_request)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)
+        ) from e
+
+
+@router.post(
+    "/v1/game/{cid}/evolve",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+async def evolve_game(cid: str, request: dict, raw_request: Request):
+    """Evolve an existing game with new text"""
+    handler = game_server(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(
+            message="Game service not available"
+        )
+
+    try:
+        from vllm.entrypoints.openai.game_server import GameEvolveRequest
+        evolve_request = GameEvolveRequest(**request)
+        return await handler.evolve_game(cid, evolve_request, raw_request)
+    except Exception as e:
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)
+        ) from e
+
+
+@router.get("/v1/game/status")
+async def get_game_system_status(raw_request: Request):
+    """Get game generation system status"""
+    handler = game_server(raw_request)
+    if handler is None:
+        return JSONResponse(content={
+            "status": "unavailable",
+            "message": "Game generation service not initialized"
+        }, status_code=503)
+
+    try:
+        status = handler.get_system_status()
+        return JSONResponse(content=status)
+    except Exception as e:
+        return JSONResponse(content={
+            "status": "error",
+            "error": str(e)
+        }, status_code=500)
+
+
 @router.get("/health", response_class=Response)
 async def health(raw_request: Request) -> Response:
     """Health check."""
