@@ -1,87 +1,114 @@
 """
-Raw Text to GΛLYPH Orchestrator
+Text Orchestrator for Game Generation
 
-Parses raw chat text and coordinates LLM GΛLYPH generation.
-Extracts game concepts, themes, and mechanics for multi-LLM processing.
+Parses raw text input and prepares structured context for LLM game generation.
+Extracts game concepts, themes, mechanics, and determines orchestration strategy.
 """
 
 import re
-import json
-from typing import Dict, List, Optional, Tuple
+import asyncio
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from enum import Enum
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-class ComplexityLevel(Enum):
+class InputComplexity(Enum):
     SIMPLE = "simple"
     MODERATE = "moderate"
     COMPLEX = "complex"
 
 
-class IntentType(Enum):
-    GENERATION = "generation"
+class OrchestrationStrategy(Enum):
+    PARALLEL = "parallel"
+    SEQUENTIAL = "sequential"
+    PIPELINE = "pipeline"
+
+
+class UserIntent(Enum):
+    CREATION = "creation"
     ITERATION = "iteration"
     EVOLUTION = "evolution"
 
 
 @dataclass
-class GameConcepts:
-    """Extracted concepts from raw text"""
+class GameConcept:
+    """Extracted game concept from raw text"""
     theme: str
     genre: str
-    mechanics: List[str]
-    assets: List[str]
+    core_mechanics: List[str]
+    setting: str
     target_audience: str
-    complexity: ComplexityLevel
-    intent: IntentType
-    keywords: List[str]
-    context: Dict[str, any]
+    complexity_score: float
 
 
 @dataclass
 class LLMContext:
-    """Context prepared for each LLM"""
-    llm_type: str
-    prompt_template: str
-    concepts: GameConcepts
-    constraints: Dict[str, any]
-    examples: Optional[List[str]] = None
+    """Structured context for each LLM"""
+    llm_type: str  # narrative, mechanics, assets, balance
+    system_prompt: str
+    user_context: str
+    constraints: List[str]
+    output_format: str
+    examples: List[str]
+
+
+@dataclass
+class TextAnalysisResult:
+    """Result of text parsing and analysis"""
+    original_text: str
+    game_concept: GameConcept
+    complexity: InputComplexity
+    intent: UserIntent
+    strategy: OrchestrationStrategy
+    llm_contexts: Dict[str, LLMContext]
 
 
 class TextOrchestrator:
-    """Orchestrates parsing of raw text and LLM context preparation"""
+    """
+    Parses raw text input and prepares structured context for LLM game generation.
+
+    This component transforms raw user input (PDF parsed to string) into structured
+    prompts for each of the 4 specialized LLMs, ensuring all prompts enforce
+    GΛLYPH code output only.
+    """
 
     def __init__(self):
+        self.complexity_keywords = {
+            InputComplexity.SIMPLE: [
+                "simple", "basic", "easy", "quick", "minimal", "straightforward"
+            ],
+            InputComplexity.MODERATE: [
+                "interesting", "moderate", "some", "multiple", "several", "standard"
+            ],
+            InputComplexity.COMPLEX: [
+                "complex", "detailed", "comprehensive", "advanced", "intricate",
+                "multiple systems", "deep", "rich", "extensive"
+            ]
+        }
+
         self.genre_patterns = {
-            'puzzle': ['puzzle', 'solve', 'brain', 'logic', 'match'],
-            'rpg': ['role', 'character', 'level', 'quest', 'story'],
-            'strategy': ['strategy', 'manage', 'build', 'resource', 'war'],
-            'action': ['action', 'fight', 'battle', 'shoot', 'run'],
-            'simulation': ['simulate', 'life', 'world', 'city', 'business'],
-            'adventure': ['adventure', 'explore', 'journey', 'discover', 'map'],
-            'sports': ['sport', 'team', 'play', 'match', 'score'],
-            'racing': ['race', 'drive', 'speed', 'car', 'track']
+            "puzzle": r"\bpuzzle|riddle|brain.*teaser|logic.*game\b",
+            "adventure": r"\badventure|exploration|quest|journey\b",
+            "rpg": r"\brpg|role.*play|character|level.*up|stats\b",
+            "strategy": r"\bstrategy|tactical|resource.*management|planning\b",
+            "simulation": r"\bsimulation|sim|manage|build|create\b",
+            "action": r"\baction|fight|combat|battle|shoot\b",
+            "card": r"\bcard|deck|hand|collectible\b",
+            "board": r"\bboard|game.*board|chess|checkers\b"
         }
 
         self.mechanic_patterns = {
-            'inventory': ['inventory', 'items', 'collect', 'carry'],
-            'crafting': ['craft', 'combine', 'make', 'build'],
-            'combat': ['fight', 'battle', 'attack', 'defend'],
-            'trading': ['trade', 'buy', 'sell', 'exchange'],
-            'dialogue': ['talk', 'dialogue', 'conversation', 'choice'],
-            'exploration': ['explore', 'discover', 'map', 'area'],
-            'progression': ['level', 'progress', 'upgrade', 'skill'],
-            'multiplayer': ['multiplayer', 'social', 'team', 'versus'],
-            'puzzle': ['puzzle', 'solve', 'logic', 'pattern'],
-            'resource': ['resource', 'gather', 'manage', 'time']
-        }
-
-        # LLM-specific prompt templates
-        self.llm_prompts = {
-            'narrative': self._create_narrative_prompt(),
-            'mechanics': self._create_mechanics_prompt(),
-            'assets': self._create_assets_prompt(),
-            'balance': self._create_balance_prompt()
+            "inventory": r"\binventory|items|collect|carry\b",
+            "combat": r"\bcombat|fight|battle|attack|damage\b",
+            "crafting": r"\bcraft|build|create|combine|make\b",
+            "trading": r"\btrade|exchange|buy|sell|market\b",
+            "exploration": r"\bexplore|discover|map|area\b",
+            "social": r"\bsocial|talk|dialogue|relationship\b",
+            "puzzle": r"\bpuzzle|solve|logic|pattern\b",
+            "resource": r"\bresource|gather|harvest|mine\b"
         }
 
     def parse_raw_text(self, text: str) -> GameConcepts:
