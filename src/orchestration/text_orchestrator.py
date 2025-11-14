@@ -111,417 +111,355 @@ class TextOrchestrator:
             "resource": r"\bresource|gather|harvest|mine\b"
         }
 
-    def parse_raw_text(self, text: str) -> GameConcepts:
+    async def analyze_text(self, raw_text: str) -> TextAnalysisResult:
         """
-        Parse raw text and extract game concepts
+        Analyze raw text input and extract game concepts.
 
         Args:
-            text: Raw text input (e.g., PDF parsed to string)
+            raw_text: Raw text input (PDF parsed to string)
 
         Returns:
-            GameConcepts: Extracted concepts and metadata
+            TextAnalysisResult with extracted concepts and LLM contexts
         """
+        logger.info(f"Analyzing text input ({len(raw_text)} characters)")
+
         # Clean and normalize text
-        cleaned_text = self._clean_text(text)
+        cleaned_text = self._clean_text(raw_text)
 
-        # Extract basic information
-        theme = self._extract_theme(cleaned_text)
-        genre = self._detect_genre(cleaned_text)
-        mechanics = self._extract_mechanics(cleaned_text)
-        assets = self._extract_assets(cleaned_text)
-        target_audience = self._detect_audience(cleaned_text)
+        # Extract game concept
+        game_concept = await self._extract_game_concept(cleaned_text)
 
-        # Analyze complexity and intent
-        complexity = self._analyze_complexity(cleaned_text, mechanics)
-        intent = self._detect_intent(cleaned_text)
+        # Determine complexity and intent
+        complexity = self._determine_complexity(cleaned_text)
+        intent = self._determine_intent(cleaned_text)
 
-        # Extract keywords
-        keywords = self._extract_keywords(cleaned_text)
+        # Determine orchestration strategy
+        strategy = self._determine_strategy(complexity, intent)
 
-        # Build context
-        context = {
-            'word_count': len(cleaned_text.split()),
-            'sentence_count': len(re.findall(r'[.!?]+', cleaned_text)),
-            'has_numbers': bool(re.search(r'\d', cleaned_text)),
-            'has_specifics': bool(re.search(r'\b(specific|exactly|number|count)\b', cleaned_text, re.I))
-        }
+        # Generate LLM contexts
+        llm_contexts = await self._generate_llm_contexts(
+            game_concept, complexity, strategy
+        )
 
-        return GameConcepts(
-            theme=theme,
-            genre=genre,
-            mechanics=mechanics,
-            assets=assets,
-            target_audience=target_audience,
+        result = TextAnalysisResult(
+            original_text=raw_text,
+            game_concept=game_concept,
             complexity=complexity,
             intent=intent,
-            keywords=keywords,
-            context=context
+            strategy=strategy,
+            llm_contexts=llm_contexts
         )
 
-    def determine_strategy(self, concepts: GameConcepts) -> str:
-        """
-        Determine orchestration strategy based on input analysis
-
-        Returns: 'parallel', 'sequential', or 'pipeline'
-        """
-        # Simple requests → parallel processing
-        if concepts.complexity == ComplexityLevel.SIMPLE:
-            return "parallel"
-
-        # Iteration requests → sequential
-        if concepts.intent == IntentType.ITERATION:
-            return "sequential"
-
-        # Complex requests → pipeline
-        if concepts.complexity == ComplexityLevel.COMPLEX:
-            return "pipeline"
-
-        # Default to parallel for moderate complexity
-        return "parallel"
-
-    def prepare_llm_contexts(self, concepts: GameConcepts) -> List[LLMContext]:
-        """
-        Prepare LLM-specific contexts and prompts
-
-        Returns list of contexts in execution order
-        """
-        strategy = self.determine_strategy(concepts)
-
-        # Base context for all LLMs
-        base_context = {
-            'theme': concepts.theme,
-            'genre': concepts.genre,
-            'target_audience': concepts.target_audience,
-            'complexity': concepts.complexity.value,
-            'keywords': concepts.keywords
-        }
-
-        # Narrative LLM context
-        narrative_context = LLMContext(
-            llm_type="narrative",
-            prompt_template=self.llm_prompts['narrative'],
-            concepts=concepts,
-            constraints={
-                'max_length': 500 if concepts.complexity == ComplexityLevel.SIMPLE else 1000,
-                'style': 'engaging and immersive',
-                'elements': ['setting', 'premise', 'objective']
-            },
-            examples=self._get_narrative_examples(concepts.genre)
-        )
-
-        # Mechanics LLM context
-        mechanics_context = LLMContext(
-            llm_type="mechanics",
-            prompt_template=self.llm_prompts['mechanics'],
-            concepts=concepts,
-            constraints={
-                'max_rules': 3 if concepts.complexity == ComplexityLevel.SIMPLE else 7,
-                'complexity_level': concepts.complexity.value,
-                'required_mechanics': concepts.mechanics
-            },
-            examples=self._get_mechanics_examples(concepts.mechanics)
-        )
-
-        # Assets LLM context
-        assets_context = LLMContext(
-            llm_type="assets",
-            prompt_template=self.llm_prompts['assets'],
-            concepts=concepts,
-            constraints={
-                'visual_style': 'consistent with theme',
-                'asset_count': 5 if concepts.complexity == ComplexityLevel.SIMPLE else 15,
-                'types': concepts.assets
-            },
-            examples=self._get_assets_examples(concepts.genre)
-        )
-
-        # Balance LLM context (receives all other outputs)
-        balance_context = LLMContext(
-            llm_type="balance",
-            prompt_template=self.llm_prompts['balance'],
-            concepts=concepts,
-            constraints={
-                'balance_range': (0.1, 0.9),
-                'cohesion_weight': 0.4,
-                'fun_weight': 0.6
-            }
-        )
-
-        # Order contexts based on strategy
-        if strategy == "pipeline":
-            return [narrative_context, mechanics_context, assets_context, balance_context]
-        elif strategy == "sequential":
-            return [narrative_context, mechanics_context, assets_context, balance_context]
-        else:  # parallel
-            return [narrative_context, mechanics_context, assets_context, balance_context]
+        logger.info(f"Analysis complete: {complexity.value} complexity, {strategy.value} strategy")
+        return result
 
     def _clean_text(self, text: str) -> str:
-        """Clean and normalize input text"""
+        """Clean and normalize raw text input."""
         # Remove excessive whitespace
         text = re.sub(r'\s+', ' ', text)
+
         # Remove special characters but keep basic punctuation
-        text = re.sub(r'[^\w\s.,!?;:]', '', text)
-        return text.strip()
+        text = re.sub(r'[^\w\s.,!?;:\-]', ' ', text)
 
-    def _extract_theme(self, text: str) -> str:
-        """Extract the main theme from text"""
-        # Simple keyword extraction for theme
-        theme_keywords = {
-            'space': ['space', 'planet', 'galaxy', 'star', 'rocket', 'universe'],
-            'fantasy': ['magic', 'dragon', 'wizard', 'kingdom', 'sword', 'spell'],
-            'modern': ['city', 'car', 'phone', 'computer', 'modern', 'technology'],
-            'historical': ['ancient', 'history', 'medieval', 'rome', 'egypt', 'castle'],
-            'nature': ['forest', 'animal', 'plant', 'ocean', 'mountain', 'wild'],
-            'abstract': ['abstract', 'concept', 'idea', 'philosophy', 'mind', 'thought']
-        }
+        # Normalize case
+        text = text.lower().strip()
 
-        text_lower = text.lower()
-        theme_scores = {}
+        return text
 
-        for theme, keywords in theme_keywords.items():
-            score = sum(1 for keyword in keywords if keyword in text_lower)
-            if score > 0:
-                theme_scores[theme] = score
+    async def _extract_game_concept(self, text: str) -> GameConcept:
+        """Extract game concept from cleaned text."""
 
-        if theme_scores:
-            return max(theme_scores, key=theme_scores.get)
-        return "general"
+        # Detect genre
+        genre = self._detect_genre(text)
+
+        # Extract theme and setting
+        theme = self._extract_theme(text)
+        setting = self._extract_setting(text)
+
+        # Identify core mechanics
+        core_mechanics = self._identify_mechanics(text)
+
+        # Determine target audience
+        target_audience = self._determine_audience(text)
+
+        # Calculate complexity score
+        complexity_score = self._calculate_complexity_score(text)
+
+        return GameConcept(
+            theme=theme,
+            genre=genre,
+            core_mechanics=core_mechanics,
+            setting=setting,
+            target_audience=target_audience,
+            complexity_score=complexity_score
+        )
 
     def _detect_genre(self, text: str) -> str:
-        """Detect game genre from text"""
-        text_lower = text.lower()
-        genre_scores = {}
-
-        for genre, patterns in self.genre_patterns.items():
-            score = sum(1 for pattern in patterns if pattern in text_lower)
-            if score > 0:
-                genre_scores[genre] = score
-
-        if genre_scores:
-            return max(genre_scores, key=genre_scores.get)
+        """Detect game genre from text."""
+        for genre, pattern in self.genre_patterns.items():
+            if re.search(pattern, text, re.IGNORECASE):
+                return genre
         return "general"
 
-    def _extract_mechanics(self, text: str) -> List[str]:
-        """Extract game mechanics from text"""
-        text_lower = text.lower()
-        found_mechanics = []
-
-        for mechanic, patterns in self.mechanic_patterns.items():
-            if any(pattern in text_lower for pattern in patterns):
-                found_mechanics.append(mechanic)
-
-        return found_mechanics
-
-    def _extract_assets(self, text: str) -> List[str]:
-        """Extract asset types from text"""
-        asset_patterns = {
-            'characters': ['character', 'player', 'hero', 'person', 'avatar'],
-            'environment': ['world', 'map', 'level', 'environment', 'background'],
-            'ui': ['interface', 'menu', 'button', 'display', 'ui'],
-            'audio': ['sound', 'music', 'audio', 'effect', 'noise'],
-            'items': ['item', 'object', 'tool', 'equipment', 'gear'],
-            'effects': ['effect', 'particle', 'animation', 'visual', 'effect']
+    def _extract_theme(self, text: str) -> str:
+        """Extract theme from text."""
+        # Look for theme keywords
+        theme_patterns = {
+            "space": r"\bspace|planet|star|galaxy|cosmic|alien\b",
+            "fantasy": r"\bfantasy|magic|wizard|dragon|medieval|kingdom\b",
+            "modern": r"\bmodern|city|contemporary|urban|business\b",
+            "historical": r"\bhistorical|ancient|rome|egypt|medieval|war\b",
+            "nature": r"\bnature|forest|ocean|animals|environment|wildlife\b",
+            "abstract": r"\babstract|geometric|minimal|artistic|creative\b"
         }
 
-        text_lower = text.lower()
-        found_assets = []
+        for theme, pattern in theme_patterns.items():
+            if re.search(pattern, text, re.IGNORECASE):
+                return theme
 
-        for asset, patterns in asset_patterns.items():
-            if any(pattern in text_lower for pattern in patterns):
-                found_assets.append(asset)
+        return "general"
 
-        return found_assets
+    def _extract_setting(self, text: str) -> str:
+        """Extract setting from text."""
+        # Extract setting descriptions
+        setting_keywords = [
+            "space station", "spaceship", "planet", "castle", "dungeon",
+            "city", "town", "forest", "island", "school", "office", "home"
+        ]
 
-    def _detect_audience(self, text: str) -> str:
-        """Detect target audience"""
+        found_settings = []
+        for keyword in setting_keywords:
+            if keyword in text:
+                found_settings.append(keyword)
+
+        return found_settings[0] if found_settings else "unspecified"
+
+    def _identify_mechanics(self, text: str) -> List[str]:
+        """Identify core game mechanics from text."""
+        mechanics = []
+        for mechanic, pattern in self.mechanic_patterns.items():
+            if re.search(pattern, text, re.IGNORECASE):
+                mechanics.append(mechanic)
+        return mechanics
+
+    def _determine_audience(self, text: str) -> str:
+        """Determine target audience from text."""
         audience_patterns = {
-            'kids': ['kid', 'child', 'young', 'simple', 'easy', 'fun'],
-            'teens': ['teen', 'challenge', 'competitive', 'social'],
-            'adults': ['adult', 'complex', 'strategic', 'deep', 'mature'],
-            'casual': ['casual', 'relax', 'simple', 'quick', 'easy'],
-            'hardcore': ['hardcore', 'difficult', 'challenge', 'complex', 'skill']
+            "kids": r"\bkids|children|young|family|casual|easy\b",
+            "teens": r"\bteen|teenager|young.*adult|school\b",
+            "adults": r"\badult|mature|complex|strategic|hard\b",
+            "all": r"\ball.*ages|family|everyone|general\b"
         }
 
-        text_lower = text.lower()
-        audience_scores = {}
+        for audience, pattern in audience_patterns.items():
+            if re.search(pattern, text, re.IGNORECASE):
+                return audience
 
-        for audience, patterns in audience_patterns.items():
-            score = sum(1 for pattern in patterns if pattern in text_lower)
-            if score > 0:
-                audience_scores[audience] = score
-
-        if audience_scores:
-            return max(audience_scores, key=audience_scores.get)
         return "general"
 
-    def _analyze_complexity(self, text: str, mechanics: List[str]) -> ComplexityLevel:
-        """Analyze complexity of the request"""
-        complexity_score = 0
+    def _calculate_complexity_score(self, text: str) -> float:
+        """Calculate complexity score (0.0 to 1.0)."""
+        score = 0.0
 
-        # Word count contribution
-        word_count = len(text.split())
-        if word_count > 50:
-            complexity_score += 1
-        if word_count > 100:
-            complexity_score += 1
+        # Base score from text length
+        if len(text) > 500:
+            score += 0.2
+        if len(text) > 1000:
+            score += 0.1
 
-        # Mechanics count contribution
-        if len(mechanics) > 3:
-            complexity_score += 1
-        if len(mechanics) > 5:
-            complexity_score += 1
+        # Score from identified mechanics
+        mechanic_count = len(self._identify_mechanics(text))
+        score += min(mechanic_count * 0.1, 0.4)
 
-        # Specific requirements contribution
-        if re.search(r'\b(specific|exactly|requirement|must|should)\b', text, re.I):
-            complexity_score += 1
+        # Score from complexity keywords
+        for complexity, keywords in self.complexity_keywords.items():
+            for keyword in keywords:
+                if keyword in text:
+                    if complexity == InputComplexity.SIMPLE:
+                        score += 0.1
+                    elif complexity == InputComplexity.MODERATE:
+                        score += 0.2
+                    else:  # COMPLEX
+                        score += 0.3
 
-        # Multi-step or conditional logic
-        if re.search(r'\b(if|then|else|when|after|before)\b', text, re.I):
-            complexity_score += 1
+        return min(score, 1.0)
 
-        if complexity_score <= 2:
-            return ComplexityLevel.SIMPLE
-        elif complexity_score <= 4:
-            return ComplexityLevel.MODERATE
+    def _determine_complexity(self, text: str) -> InputComplexity:
+        """Determine input complexity level."""
+        complexity_score = self._calculate_complexity_score(text)
+
+        if complexity_score < 0.3:
+            return InputComplexity.SIMPLE
+        elif complexity_score < 0.7:
+            return InputComplexity.MODERATE
         else:
-            return ComplexityLevel.COMPLEX
+            return InputComplexity.COMPLEX
 
-    def _detect_intent(self, text: str) -> IntentType:
-        """Detect user intent from text"""
-        text_lower = text.lower()
-
-        if any(word in text_lower for word in ['create', 'generate', 'make', 'build']):
-            return IntentType.GENERATION
-        elif any(word in text_lower for word in ['update', 'modify', 'change', 'improve', 'add']):
-            return IntentType.ITERATION
-        elif any(word in text_lower for word in ['evolve', 'expand', 'grow', 'develop']):
-            return IntentType.EVOLUTION
-        else:
-            return IntentType.GENERATION
-
-    def _extract_keywords(self, text: str) -> List[str]:
-        """Extract important keywords from text"""
-        # Simple keyword extraction - remove common words and keep important ones
-        common_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'can', 'must'}
-
-        words = re.findall(r'\b\w+\b', text.lower())
-        keywords = [word for word in words if word not in common_words and len(word) > 2]
-
-        # Return top keywords by frequency
-        from collections import Counter
-        word_counts = Counter(keywords)
-        return [word for word, count in word_counts.most_common(10)]
-
-    def _create_narrative_prompt(self) -> str:
-        """Create prompt template for narrative LLM"""
-        return """
-OUTPUT ONLY VALID GΛLYPH CODE
-
-Generate a GΛLYPH lambda expression for the game narrative/theme.
-
-Theme: {theme}
-Genre: {genre}
-Target Audience: {target_audience}
-Complexity: {complexity}
-
-Create a narrative expression with:
-- Setting description
-- Core premise
-- Player objective
-
-Format:
-λnarrative -> let setting = "..." in let premise = "..." in let objective = "..." in narrative_manifest(setting, premise, objective)
-
-Constraints:
-- Max length: {max_length}
-- Style: {style}
-- Must include: {elements}
-
-OUTPUT ONLY VALID GΛLYPH CODE
-"""
-
-    def _create_mechanics_prompt(self) -> str:
-        """Create prompt template for mechanics LLM"""
-        return """
-OUTPUT ONLY VALID GΛLYPH CODE
-
-Generate GΛLYPH lambda expressions for game mechanics.
-
-Theme: {theme}
-Required Mechanics: {required_mechanics}
-Complexity Level: {complexity}
-
-Create {max_rules} game rule expressions:
-- Each rule as a pure function
-- No mutable state
-- Deterministic outcomes
-
-Format example:
-λmechanics -> let move_rule = λstate -> λaction -> ... in let win_rule = λstate -> ... in mechanics_manifest([move_rule, win_rule])
-
-OUTPUT ONLY VALID GΛLYPH CODE
-"""
-
-    def _create_assets_prompt(self) -> str:
-        """Create prompt template for assets LLM"""
-        return """
-OUTPUT ONLY VALID GΛLYPH CODE
-
-Generate GΛLYPH lambda expressions for visual assets.
-
-Theme: {theme}
-Visual Style: consistent with {theme}
-Asset Types: {types}
-Asset Count: {asset_count}
-
-Create asset descriptors as immutable data structures:
-- Visual properties
-- Display rules
-- Interaction handlers
-
-Format:
-λassets -> let characters = [...] in let environment = [...] in assets_manifest(characters, environment)
-
-OUTPUT ONLY VALID GΛLYPH CODE
-"""
-
-    def _create_balance_prompt(self) -> str:
-        """Create prompt template for balance LLM"""
-        return """
-OUTPUT ONLY VALID GΛLYPH CODE
-
-Merge all GΛLYPH expressions into a single game manifest.
-
-Inputs:
-- Narrative: [NARRATIVE_OUTPUT]
-- Mechanics: [MECHANICS_OUTPUT]
-- Assets: [ASSETS_OUTPUT]
-
-Create unified λgame expression:
-- Balance all components
-- Ensure coherence
-- Output final balance score (0.0-1.0)
-
-Format:
-λgame -> let story = [merged_narrative] in let rules = [merged_mechanics] in let visuals = [merged_assets] in let balance = 0.75 in game_manifest(story, rules, visuals, balance)
-
-CRITICAL: OUTPUT ONLY VALID GΛLYPH CODE
-"""
-
-    def _get_narrative_examples(self, genre: str) -> List[str]:
-        """Get example narrative expressions for genre"""
-        examples = {
-            'puzzle': ['λnarrative -> let setting = "mystical temple" in let premise = "solve ancient puzzles" in let objective = "unlock the treasure" in narrative_manifest(setting, premise, objective)'],
-            'rpg': ['λnarrative -> let setting = "fantasy kingdom" in let premise = "save the realm" in let objective = "defeat the dark lord" in narrative_manifest(setting, premise, objective)']
+    def _determine_intent(self, text: str) -> UserIntent:
+        """Determine user intent from text."""
+        intent_patterns = {
+            UserIntent.ITERATION: r"\brefine|improve|fix|change|modify|update\b",
+            UserIntent.EVOLUTION: r"\bevolve|expand|add|extend|continue|sequel\b",
+            UserIntent.CREATION: r"\bcreate|make|build|design|generate|new\b"
         }
-        return examples.get(genre, [])
 
-    def _get_mechanics_examples(self, mechanics: List[str]) -> List[str]:
-        """Get example mechanics expressions"""
-        base_example = 'λmechanics -> let move = λstate -> λdirection -> update_position(state, direction) in let check_win = λstate -> is_goal_reached(state) in mechanics_manifest([move, check_win])'
-        return [base_example]
+        for intent, pattern in intent_patterns.items():
+            if re.search(pattern, text, re.IGNORECASE):
+                return intent
 
-    def _get_assets_examples(self, genre: str) -> List[str]:
-        """Get example assets expressions"""
-        base_example = 'λassets -> let player = {sprite: "hero", size: (32, 32)} in let world = {tiles: "grassland", size: (100, 100)} in assets_manifest([player, world])'
-        return [base_example]
+        return UserIntent.CREATION
+
+    def _determine_strategy(self, complexity: InputComplexity, intent: UserIntent) -> OrchestrationStrategy:
+        """Determine orchestration strategy based on complexity and intent."""
+        if complexity == InputComplexity.SIMPLE:
+            return OrchestrationStrategy.PARALLEL
+        elif intent == UserIntent.ITERATION:
+            return OrchestrationStrategy.SEQUENTIAL
+        else:
+            return OrchestrationStrategy.PIPELINE
+
+    async def _generate_llm_contexts(self, concept: GameConcept, complexity: InputComplexity, strategy: OrchestrationStrategy) -> Dict[str, LLMContext]:
+        """Generate structured context for each LLM."""
+
+        contexts = {}
+
+        # Narrative LLM Context (Phi-3)
+        contexts["narrative"] = LLMContext(
+            llm_type="narrative",
+            system_prompt=self._get_narrative_system_prompt(),
+            user_context=self._get_narrative_context(concept),
+            constraints=["OUTPUT ONLY VALID GΛLYPH CODE", "Use λlet expressions", "Focus on story elements"],
+            output_format="GΛLYPH lambda expression",
+            examples=[self._get_narrative_example(concept.genre)]
+        )
+
+        # Mechanics LLM Context (Gemma-2B)
+        contexts["mechanics"] = LLMContext(
+            llm_type="mechanics",
+            system_prompt=self._get_mechanics_system_prompt(),
+            user_context=self._get_mechanics_context(concept),
+            constraints=["OUTPUT ONLY VALID GΛLYPH CODE", "Use functional patterns", "Define game rules"],
+            output_format="GΛLYPH lambda expression",
+            examples=[self._get_mechanics_example(concept.core_mechanics)]
+        )
+
+        # Assets LLM Context (TinyLlama)
+        contexts["assets"] = LLMContext(
+            llm_type="assets",
+            system_prompt=self._get_assets_system_prompt(),
+            user_context=self._get_assets_context(concept),
+            constraints=["OUTPUT ONLY VALID GΛLYPH CODE", "Describe visual elements", "Define item properties"],
+            output_format="GΛLYPH lambda expression",
+            examples=[self._get_assets_example(concept.theme)]
+        )
+
+        # Balance LLM Context (Qwen-0.5B)
+        contexts["balance"] = LLMContext(
+            llm_type="balance",
+            system_prompt=self._get_balance_system_prompt(),
+            user_context=self._get_balance_context(concept, complexity),
+            constraints=["OUTPUT ONLY VALID GΛLYPH CODE", "Ensure game balance", "Create single λgame expression"],
+            output_format="Single merged GΛLYPH λgame expression",
+            examples=[self._get_balance_example()]
+        )
+
+        return contexts
+
+    def _get_narrative_system_prompt(self) -> str:
+        return """You are a narrative designer for functional games. OUTPUT ONLY VALID GΛLYPH CODE.
+
+Create narrative elements using GΛLYPH lambda calculus expressions. Use λlet expressions to define story components.
+
+Your output must be valid GΛLYPH that can be parsed by glyph_parser."""
+
+    def _get_mechanics_system_prompt(self) -> str:
+        return """You are a game mechanics designer. OUTPUT ONLY VALID GΛLYPH CODE.
+
+Define game rules and mechanics using GΛLYPH functional programming patterns. Use lambda expressions and immutable data structures.
+
+Your output must be valid GΛLYPH that can be parsed by glyph_parser."""
+
+    def _get_assets_system_prompt(self) -> str:
+        return """You are an asset and visual designer. OUTPUT ONLY VALID GΛLYPH CODE.
+
+Define visual elements, items, and assets using GΛLYPH expressions. Use functional patterns to describe properties.
+
+Your output must be valid GΛLYPH that can be parsed by glyph_parser."""
+
+    def _get_balance_system_prompt(self) -> str:
+        return """You are a game balance designer. OUTPUT ONLY VALID GΛLYPH CODE.
+
+Merge all game components into a single λgame expression. Ensure proper balance and coherence.
+
+Your output must be a single valid GΛLYPH λgame expression that can be parsed by glyph_parser."""
+
+    def _get_narrative_context(self, concept: GameConcept) -> str:
+        return f"""Create narrative elements for a {concept.genre} game with {concept.theme} theme.
+Setting: {concept.setting}
+Core mechanics: {', '.join(concept.core_mechanics)}
+Target audience: {concept.target_audience}"""
+
+    def _get_mechanics_context(self, concept: GameConcept) -> str:
+        return f"""Design game mechanics for a {concept.genre} game.
+Core mechanics to implement: {', '.join(concept.core_mechanics)}
+Theme: {concept.theme}
+Setting: {concept.setting}"""
+
+    def _get_assets_context(self, concept: GameConcept) -> str:
+        return f"""Design visual assets for a {concept.theme} themed {concept.genre} game.
+Setting: {concept.setting}
+Core mechanics: {', '.join(concept.core_mechanics)}"""
+
+    def _get_balance_context(self, concept: GameConcept, complexity: InputComplexity) -> str:
+        return f"""Balance and merge game components for a {concept.genre} game.
+Complexity level: {complexity.value}
+Theme: {concept.theme}
+Core mechanics: {', '.join(concept.core_mechanics)}
+Create a single cohesive λgame expression."""
+
+    def _get_narrative_example(self, genre: str) -> str:
+        return """λlet story = "In a world of endless wonder..." in
+λlet protagonist = hero("Ada") in
+λlet conflict = quest("find the lost artifact") in
+story protagonist conflict"""
+
+    def _get_mechanics_example(self, mechanics: List[str]) -> str:
+        return """λlet rules = [
+  rule("move", λstate -> λaction -> transition(state, action)),
+  rule("collect", λstate -> λitem -> update_inventory(state, item))
+] in
+λlet win_condition = λstate -> check_victory(state) in
+rules win_condition"""
+
+    def _get_assets_example(self, theme: str) -> str:
+        return """λlet items = [
+  item("crystal", prop("color", "blue"), prop("power", 5)),
+  item("key", prop("uses", 1), prop("required", true))
+] in
+λlet environments = [env("forest"), env("cave")] in
+items environments"""
+
+    def _get_balance_example(self) -> str:
+        return """λgame ->
+  let story = "Adventure awaits..." in
+  let mechanics = [move_rule, collect_rule] in
+  let assets = [crystal_item, key_item] in
+  let balance = 0.75 in
+  manifest story mechanics assets balance"""
+
+
+# Singleton instance
+text_orchestrator = TextOrchestrator()
+
+
+async def analyze_user_input(raw_text: str) -> TextAnalysisResult:
+    """
+    Analyze user input and prepare LLM contexts.
+
+    Args:
+        raw_text: Raw text input from user (PDF parsed to string)
+
+    Returns:
+        TextAnalysisResult with structured contexts for all LLMs
+    """
+    return await text_orchestrator.analyze_text(raw_text)
