@@ -138,356 +138,436 @@ class GameOrchestrator:
             "llm_response_times": {llm_type: [] for llm_type in LLMType}
         }
 
-    async def orchestrate_generation(
-        self,
-        contexts: List[LLMContext],
-        strategy: Optional[str] = None
-    ) -> OrchestrationResult:
+  async def generate_game(self, request: GameGenerationRequest) -> GameGenerationResult:
         """
-        Orchestrate game generation using specified strategy
+        Generate a game using the 4 specialized LLMs.
 
         Args:
-            contexts: List of LLM contexts prepared by text orchestrator
-            strategy: Override strategy ('parallel', 'sequential', 'pipeline')
+            request: Game generation request with text analysis
 
         Returns:
-            OrchestrationResult: Complete result with all LLM responses
+            GameGenerationResult with final GΛLYPH expression and metadata
         """
         start_time = time.time()
+        request_id = request.request_id
 
-        # Determine execution strategy
-        if strategy:
-            exec_strategy = ExecutionStrategy(strategy)
-        else:
-            exec_strategy = self._determine_strategy(contexts)
+        logger.info(f"Starting game generation {request_id} with strategy: {request.text_analysis.strategy.value}")
+
+        # Track active request
+        self.active_requests[request_id] = request
+        self.generation_metrics["total_requests"] += 1
 
         try:
-            if exec_strategy == ExecutionStrategy.PARALLEL:
-                responses = await self._execute_parallel(contexts)
-            elif exec_strategy == ExecutionStrategy.SEQUENTIAL:
-                responses = await self._execute_sequential(contexts)
+            # Execute based on strategy
+            if request.text_analysis.strategy == OrchestrationStrategy.PARALLEL:
+                llm_responses = await self._execute_parallel(request)
+            elif request.text_analysis.strategy == OrchestrationStrategy.SEQUENTIAL:
+                llm_responses = await self._execute_sequential(request)
             else:  # PIPELINE
-                responses = await self._execute_pipeline(contexts)
+                llm_responses = await self._execute_pipeline(request)
 
-            total_time = time.time() - start_time
+            # Validate responses
+            valid_responses = self._validate_responses(llm_responses)
+            if not valid_responses:
+                raise ValueError("No valid LLM responses received")
 
-            return OrchestrationResult(
-                strategy=exec_strategy,
-                responses=responses,
-                total_time=total_time,
-                success=True
+            # Generate final result
+            final_result = await self._generate_final_result(valid_responses, request)
+
+            generation_time = time.time() - start_time
+
+            # Update metrics
+            self.generation_metrics["successful_requests"] += 1
+            self._update_performance_metrics(generation_time, llm_responses)
+
+            result = GameGenerationResult(
+                request_id=request_id,
+                success=True,
+                final_glyph_expression=final_result,
+                llm_responses=llm_responses,
+                generation_time=generation_time,
+                strategy_used=request.text_analysis.strategy,
+                metadata={
+                    "complexity": request.text_analysis.complexity.value,
+                    "intent": request.text_analysis.intent.value,
+                    "genre": request.text_analysis.game_concept.genre,
+                    "theme": request.text_analysis.game_concept.theme
+                }
             )
 
+            logger.info(f"Game generation {request_id} completed successfully in {generation_time:.2f}s")
+            return result
+
         except Exception as e:
-            total_time = time.time() - start_time
-            return OrchestrationResult(
-                strategy=exec_strategy,
-                responses=[],
-                total_time=total_time,
+            generation_time = time.time() - start_time
+            self.generation_metrics["failed_requests"] += 1
+
+            logger.error(f"Game generation {request_id} failed: {str(e)}")
+
+            return GameGenerationResult(
+                request_id=request_id,
                 success=False,
+                final_glyph_expression="",
+                llm_responses={},
+                generation_time=generation_time,
+                strategy_used=request.text_analysis.strategy,
                 error=str(e)
             )
 
-    async def _execute_parallel(self, contexts: List[LLMContext]) -> List[LLMResponse]:
-        """Execute all LLMs in parallel"""
+        finally:
+            # Clean up active request
+            self.active_requests.pop(request_id, None)
+
+    async def _execute_parallel(self, request: GameGenerationRequest) -> Dict[LLMType, LLMResponse]:
+        """Execute all LLMs in parallel for simple requests."""
+        logger.info(f"Executing parallel generation for {request.request_id}")
+
         tasks = []
-        for context in contexts:
-            task = asyncio.create_task(
-                self._execute_llm_with_retry(context)
-            )
+        for llm_type, context in request.text_analysis.llm_contexts.items():
+            task = self._call_llm(LLMType(llm_type), context, request.request_id)
             tasks.append(task)
 
-        # Wait for all tasks to complete
+        # Wait for all LLMs to complete
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Handle exceptions and ensure all responses are LLMResponse objects
-        processed_responses = []
+        # Process responses
+        llm_responses = {}
         for i, response in enumerate(responses):
+            llm_type = list(LLMType)[i]
             if isinstance(response, Exception):
-                # Create error response
-                processed_responses.append(LLMResponse(
-                    llm_type=contexts[i].llm_type,
+                logger.error(f"LLM {llm_type.value} failed: {response}")
+                llm_responses[llm_type] = LLMResponse(
+                    llm_type=llm_type,
+                    model_name=self.models[llm_type].model_name,
                     raw_response="",
                     glyph_expression="",
                     is_valid_glyph=False,
-                    validation_error=str(response)
-                ))
+                    response_time=0.0,
+                    token_usage=0,
+                    error=str(response)
+                )
             else:
-                processed_responses.append(response)
+                llm_responses[llm_type] = response
 
-        return processed_responses
+        return llm_responses
 
-    async def _execute_sequential(self, contexts: List[LLMContext]) -> List[LLMResponse]:
-        """Execute LLMs sequentially (for iteration/intent refinement)"""
-        responses = []
-        accumulated_context = {}
+    async def _execute_sequential(self, request: GameGenerationRequest) -> Dict[LLMType, LLMResponse]:
+        """Execute LLMs sequentially for iteration requests."""
+        logger.info(f"Executing sequential generation for {request.request_id}")
 
-        for context in contexts:
-            # Add accumulated context from previous LLMs
-            if accumulated_context:
-                context.constraints.update(accumulated_context)
+        llm_responses = {}
+        accumulated_context = ""
 
-            response = await self._execute_llm_with_retry(context)
-            responses.append(response)
+        # Execution order for sequential processing
+        execution_order = [LLMType.NARRATIVE, LLMType.MECHANICS, LLMType.ASSETS, LLMType.BALANCE]
 
-            # Accumulate successful responses for next LLM
-            if response.is_valid_glyph:
-                accumulated_context[f"previous_{context.llm_type}"] = response.glyph_expression
-
-        return responses
-
-    async def _execute_pipeline(self, contexts: List[LLMContext]) -> List[LLMResponse]:
-        """Execute LLMs in dependency pipeline (narrative -> mechanics -> assets -> balance)"""
-        # Sort contexts by pipeline order
-        context_map = {ctx.llm_type: ctx for ctx in contexts}
-        ordered_types = ['narrative', 'mechanics', 'assets', 'balance']
-
-        responses = []
-        pipeline_data = {}
-
-        for llm_type in ordered_types:
-            if llm_type not in context_map:
+        for llm_type in execution_order:
+            if llm_type.value not in request.text_analysis.llm_contexts:
                 continue
 
-            context = context_map[llm_type]
+            context = request.text_analysis.llm_contexts[llm_type.value]
 
-            # Inject pipeline data from previous stages
-            if llm_type == 'mechanics' and 'narrative' in pipeline_data:
-                context.constraints['narrative_output'] = pipeline_data['narrative']
-            elif llm_type == 'assets' and 'narrative' in pipeline_data:
-                context.constraints['narrative_output'] = pipeline_data['narrative']
-                if 'mechanics' in pipeline_data:
-                    context.constraints['mechanics_output'] = pipeline_data['mechanics']
-            elif llm_type == 'balance':
-                # Balance LLM gets all previous outputs
-                for prev_type, prev_output in pipeline_data.items():
-                    context.constraints[f'{prev_type}_output'] = prev_output
+            # Modify context to include previous outputs
+            if accumulated_context:
+                context.user_context += f"\n\nPrevious outputs:\n{accumulated_context}"
 
-            response = await self._execute_llm_with_retry(context)
-            responses.append(response)
+            response = await self._call_llm(llm_type, context, request.request_id)
+            llm_responses[llm_type] = response
 
-            # Store successful response for pipeline
+            # Accumulate valid responses for next LLM
             if response.is_valid_glyph:
-                pipeline_data[llm_type] = response.glyph_expression
+                accumulated_context += f"\n{llm_type.value}: {response.glyph_expression}"
 
-        return responses
+        return llm_responses
 
-    async def _execute_llm_with_retry(self, context: LLMContext) -> LLMResponse:
-        """Execute LLM with retry logic"""
-        last_error = None
+    async def _execute_pipeline(self, request: GameGenerationRequest) -> Dict[LLMType, LLMResponse]:
+        """Execute LLMs in pipeline where outputs inform next LLM."""
+        logger.info(f"Executing pipeline generation for {request.request_id}")
 
-        for attempt in range(self.max_retries):
-            try:
-                response = await self._execute_single_llm(context)
+        llm_responses = {}
 
-                # Validate GΛLYPH expression
-                if self._validate_glyph_expression(response.glyph_expression):
-                    return response
-                else:
-                    # Invalid GΛLYPH - retry with simplified prompt
-                    if attempt < self.max_retries - 1:
-                        context = self._simplify_context(context, response.glyph_expression)
-                        await asyncio.sleep(self.retry_delay * (attempt + 1))
-                    continue
+        # Pipeline: Narrative -> Mechanics -> Assets -> Balance
+        pipeline_order = [
+            (LLMType.NARRATIVE, "story_elements"),
+            (LLMType.MECHANICS, "game_rules"),
+            (LLMType.ASSETS, "visual_assets"),
+            (LLMType.BALANCE, "final_balance")
+        ]
 
-            except Exception as e:
-                last_error = e
-                if attempt < self.max_retries - 1:
-                    await asyncio.sleep(self.retry_delay * (attempt + 1))
-                    continue
+        pipeline_outputs = {}
 
-        # All retries failed
-        return LLMResponse(
-            llm_type=context.llm_type,
-            raw_response="",
-            glyph_expression="",
-            is_valid_glyph=False,
-            validation_error=str(last_error) if last_error else "Max retries exceeded"
-        )
+        for llm_type, output_key in pipeline_order:
+            if llm_type.value not in request.text_analysis.llm_contexts:
+                continue
 
-    async def _execute_single_llm(self, context: LLMContext) -> LLMResponse:
-        """Execute a single LLM call"""
+            context = request.text_analysis.llm_contexts[llm_type.value]
+
+            # Modify context to include pipeline outputs
+            if pipeline_outputs:
+                pipeline_context = "\n".join([
+                    f"{key}: {output}" for key, output in pipeline_outputs.items()
+                ])
+                context.user_context += f"\n\nPipeline inputs:\n{pipeline_context}"
+
+            response = await self._call_llm(llm_type, context, request.request_id)
+            llm_responses[llm_type] = response
+
+            # Store output for pipeline
+            if response.is_valid_glyph:
+                pipeline_outputs[output_key] = response.glyph_expression
+
+        return llm_responses
+
+    async def _call_llm(self, llm_type: LLMType, context: LLMContext, request_id: str) -> LLMResponse:
+        """Call individual LLM with context and retry logic."""
+        model = self.models[llm_type]
         start_time = time.time()
 
-        # Prepare the final prompt
-        prompt = self._prepare_final_prompt(context)
+        logger.debug(f"Calling {llm_type.value} LLM ({model.model_name}) for request {request_id}")
 
-        # Get LLM configuration
-        llm_config = self.llm_configs[context.llm_type]
+        try:
+            # Prepare request payload
+            payload = {
+                "model": model.model_name,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": context.system_prompt
+                    },
+                    {
+                        "role": "user",
+                        "content": context.user_context
+                    }
+                ],
+                "max_tokens": model.max_tokens,
+                "temperature": model.temperature,
+                "stream": False
+            }
 
-        # Simulate LLM call (replace with actual vLLM API call)
-        raw_response = await self._call_llm_api(prompt, llm_config)
+            # Make API call
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=model.timeout)) as session:
+                async with session.post(
+                    f"{self.vllm_api_url}{model.api_endpoint}",
+                    json=payload,
+                    headers={"Content-Type": "application/json"}
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise Exception(f"API call failed with status {response.status}: {error_text}")
 
-        # Extract GΛLYPH expression from response
-        glyph_expression = self._extract_glyph_expression(raw_response)
+                    result = await response.json()
 
-        execution_time = time.time() - start_time
+                    # Extract response content
+                    raw_response = result["choices"][0]["message"]["content"]
+                    token_usage = result.get("usage", {}).get("total_tokens", 0)
+                    response_time = time.time() - start_time
 
-        return LLMResponse(
-            llm_type=context.llm_type,
-            raw_response=raw_response,
-            glyph_expression=glyph_expression,
-            is_valid_glyph=False,  # Will be validated in retry logic
-            execution_time=execution_time
-        )
+                    # Validate GΛLYPH expression
+                    glyph_expression = self._extract_glyph_expression(raw_response)
+                    is_valid_glyph = self._validate_glyph_syntax(glyph_expression)
 
-    def _prepare_final_prompt(self, context: LLMContext) -> str:
-        """Prepare the final prompt for the LLM"""
-        # Start with base template
-        prompt = context.prompt_template
+                    logger.debug(f"{llm_type.value} LLM response: {response_time:.2f}s, valid_glyph={is_valid_glyph}")
 
-        # Replace placeholders with context data
-        replacements = {
-            'theme': context.concepts.theme,
-            'genre': context.concepts.genre,
-            'target_audience': context.concepts.target_audience,
-            'complexity': context.concepts.complexity.value,
-            'keywords': ', '.join(context.concepts.keywords)
-        }
+                    return LLMResponse(
+                        llm_type=llm_type,
+                        model_name=model.model_name,
+                        raw_response=raw_response,
+                        glyph_expression=glyph_expression,
+                        is_valid_glyph=is_valid_glyph,
+                        response_time=response_time,
+                        token_usage=token_usage
+                    )
 
-        # Add constraints-specific replacements
-        for key, value in context.constraints.items():
-            if isinstance(value, list):
-                replacements[key] = ', '.join(str(v) for v in value)
-            else:
-                replacements[key] = str(value)
+        except asyncio.TimeoutError:
+            error_msg = f"LLM {llm_type.value} timed out after {model.timeout}s"
+            logger.error(error_msg)
+            return LLMResponse(
+                llm_type=llm_type,
+                model_name=model.model_name,
+                raw_response="",
+                glyph_expression="",
+                is_valid_glyph=False,
+                response_time=model.timeout,
+                token_usage=0,
+                error=error_msg
+            )
 
-        # Replace placeholders
-        for placeholder, value in replacements.items():
-            prompt = prompt.replace(f'{{{placeholder}}}', value)
-
-        # Add pipeline data if present
-        for key, value in context.constraints.items():
-            if key.endswith('_output') and isinstance(value, str):
-                prompt = prompt.replace(f'[{key.upper()}]', value)
-
-        return prompt
-
-    async def _call_llm_api(self, prompt: str, llm_config: Dict[str, Any]) -> str:
-        """
-        Call the LLM API (placeholder for actual vLLM integration)
-
-        This would be replaced with actual vLLM OpenAI-compatible API call
-        """
-        # Placeholder implementation - replace with actual API call
-        # For now, return a mock GΛLYPH expression based on the LLM type
-
-        await asyncio.sleep(0.1)  # Simulate API latency
-
-        if 'narrative' in prompt.lower():
-            return 'λnarrative -> let setting = "mystical world" in let premise = "explore and discover" in let objective = "find the artifact" in narrative_manifest(setting, premise, objective)'
-        elif 'mechanics' in prompt.lower():
-            return 'λmechanics -> let move = λstate -> λdirection -> update_position(state, direction) in let interact = λstate -> λobject -> check_collision(state, object) in mechanics_manifest([move, interact])'
-        elif 'assets' in prompt.lower():
-            return 'λassets -> let player = {sprite: "hero", position: (0, 0)} in let world = {tiles: "ground", size: (100, 100)} in assets_manifest(player, world)'
-        elif 'balance' in prompt.lower():
-            return 'λgame -> let story = λnarrative -> let setting = "mystical world" in let premise = "explore and discover" in let objective = "find the artifact" in narrative_manifest(setting, premise, objective) in let rules = λmechanics -> let move = λstate -> λdirection -> update_position(state, direction) in let interact = λstate -> λobject -> check_collision(state, object) in mechanics_manifest([move, interact]) in let visuals = λassets -> let player = {sprite: "hero", position: (0, 0)} in let world = {tiles: "ground", size: (100, 100)} in assets_manifest(player, world) in let balance = 0.75 in game_manifest(story, rules, visuals, balance)'
-        else:
-            return 'λmanifest -> simple_game_manifest'
+        except Exception as e:
+            error_msg = f"LLM {llm_type.value} call failed: {str(e)}"
+            logger.error(error_msg)
+            response_time = time.time() - start_time
+            return LLMResponse(
+                llm_type=llm_type,
+                model_name=model.model_name,
+                raw_response="",
+                glyph_expression="",
+                is_valid_glyph=False,
+                response_time=response_time,
+                token_usage=0,
+                error=error_msg
+            )
 
     def _extract_glyph_expression(self, raw_response: str) -> str:
-        """Extract GΛLYPH expression from raw response"""
-        # Look for lambda expressions in the response
+        """Extract GΛLYPH expression from LLM response."""
+        # Look for code blocks with GΛLYPH
         import re
 
-        # Pattern to match lambda expressions
-        lambda_pattern = r'λ\w+\s*->.*'
-        matches = re.findall(lambda_pattern, raw_response, re.MULTILINE | re.DOTALL)
+        # Try to extract from code blocks
+        code_block_pattern = r'```(?:g(?:lyph)?|l(?:ambda)?)?\s*\n?(.*?)\n?```'
+        matches = re.findall(code_block_pattern, raw_response, re.DOTALL | re.IGNORECASE)
 
         if matches:
-            # Return the longest match (most likely to be complete)
-            return max(matches, key=len)
+            return matches[0].strip()
 
-        # If no lambda found, return as-is (might be a simple expression)
+        # Look for lambda expressions
+        lambda_pattern = r'λ.*?->.*'
+        lambda_matches = re.findall(lambda_pattern, raw_response, re.DOTALL)
+
+        if lambda_matches:
+            return lambda_matches[0].strip()
+
+        # Return cleaned response as fallback
         return raw_response.strip()
 
-    def _validate_glyph_expression(self, expression: str) -> bool:
-        """
-        Validate that the expression is valid GΛLYPH code
-
-        This is a simplified validation - in production, use the actual GΛLYPH parser
-        """
-        if not expression:
+    def _validate_glyph_syntax(self, glyph_expression: str) -> bool:
+        """Basic validation of GΛLYPH syntax."""
+        if not glyph_expression:
             return False
 
-        # Basic structural validation
-        if 'λ' not in expression:
-            return False
+        # Check for basic GΛLYPH syntax elements
+        has_lambda = 'λ' in glyph_expression or '\\' in glyph_expression
+        has_arrow = '->' in glyph_expression
 
         # Check for balanced parentheses and brackets
-        if not self._check_balanced_delimiters(expression):
-            return False
+        open_parens = glyph_expression.count('(')
+        close_parens = glyph_expression.count(')')
+        open_brackets = glyph_expression.count('[')
+        close_brackets = glyph_expression.count(']')
 
-        # Check for GΛLYPH keywords
-        glyph_keywords = ['let', 'in', 'match', 'if', 'then', 'else', 'λ']
-        if not any(keyword in expression for keyword in glyph_keywords):
-            return False
+        is_balanced = (open_parens == close_parens) and (open_brackets == close_brackets)
 
-        return True
+        # Basic structure validation
+        has_let = 'let' in glyph_expression
+        has_structure = has_lambda and has_arrow and is_balanced
 
-    def _check_balanced_delimiters(self, expression: str) -> bool:
-        """Check if parentheses, brackets, and braces are balanced"""
-        stack = []
-        pairs = {'(': ')', '[': ']', '{': '}'}
+        return has_structure
 
-        for char in expression:
-            if char in pairs:
-                stack.append(char)
-            elif char in pairs.values():
-                if not stack:
-                    return False
-                if pairs[stack.pop()] != char:
-                    return False
+    def _validate_responses(self, llm_responses: Dict[LLMType, LLMResponse]) -> Dict[LLMType, LLMResponse]:
+        """Validate and filter LLM responses."""
+        valid_responses = {}
 
-        return not stack
+        for llm_type, response in llm_responses.items():
+            if response.is_valid_glyph and not response.error:
+                valid_responses[llm_type] = response
+            else:
+                logger.warning(f"Invalid response from {llm_type.value}: {response.error}")
 
-    def _simplify_context(self, context: LLMContext, failed_expression: str) -> LLMContext:
-        """Create simplified context for retry"""
-        simplified = LLMContext(
-            llm_type=context.llm_type,
-            prompt_template=context.prompt_template,
-            concepts=context.concepts,
-            constraints=context.constraints.copy()
-        )
+        # Ensure we have at least some valid responses
+        if not valid_responses:
+            logger.error("No valid LLM responses received")
+            return {}
 
-        # Add simplification instructions
-        simplified.constraints['simplify'] = True
-        simplified.constraints['previous_attempt'] = failed_expression[:100]  # First 100 chars
+        return valid_responses
 
-        return simplified
+    async def _generate_final_result(self, valid_responses: Dict[LLMType, LLMResponse], request: GameGenerationRequest) -> str:
+        """Generate final GΛLYPH expression from valid LLM responses."""
 
-    def _determine_strategy(self, contexts: List[LLMContext]) -> ExecutionStrategy:
-        """Determine best execution strategy based on contexts"""
-        # Check if any context indicates iteration intent
-        for context in contexts:
-            if context.concepts.intent.value == 'iteration':
-                return ExecutionStrategy.SEQUENTIAL
+        # If balance LLM provided a complete expression, use it
+        if LLMType.BALANCE in valid_responses:
+            balance_response = valid_responses[LLMType.BALANCE]
+            if balance_response.is_valid_glyph and 'λgame' in balance_response.glyph_expression:
+                return balance_response.glyph_expression
 
-        # Check complexity levels
-        complexity_levels = [ctx.concepts.complexity for ctx in contexts]
-        if any(level.value == 'complex' for level in complexity_levels):
-            return ExecutionStrategy.PIPELINE
+        # Otherwise, construct from individual responses
+        narrative_expr = valid_responses.get(LLMType.NARRATIVE, LLMResponse(
+            llm_type=LLMType.NARRATIVE, model_name="", raw_response="",
+            glyph_expression='let story = "Generated story..."',
+            is_valid_glyph=True, response_time=0, token_usage=0
+        )).glyph_expression
 
-        # Default to parallel for simple/moderate requests
-        return ExecutionStrategy.PARALLEL
+        mechanics_expr = valid_responses.get(LLMType.MECHANICS, LLMResponse(
+            llm_type=LLMType.MECHANICS, model_name="", raw_response="",
+            glyph_expression='let mechanics = [rule("move", λstate -> λaction -> state)]',
+            is_valid_glyph=True, response_time=0, token_usage=0
+        )).glyph_expression
 
-    def get_performance_metrics(self, result: OrchestrationResult) -> Dict[str, Any]:
-        """Extract performance metrics from orchestration result"""
-        metrics = {
-            'strategy': result.strategy.value,
-            'total_time': result.total_time,
-            'success': result.success,
-            'llm_count': len(result.responses),
-            'valid_glyph_count': sum(1 for r in result.responses if r.is_valid_glyph),
-            'average_llm_time': 0.0,
-            'llm_times': {}
+        assets_expr = valid_responses.get(LLMType.ASSETS, LLMResponse(
+            llm_type=LLMType.ASSETS, model_name="", raw_response="",
+            glyph_expression='let assets = [item("crystal")]',
+            is_valid_glyph=True, response_time=0, token_usage=0
+        )).glyph_expression
+
+        # Construct final expression
+        final_expression = f"""λgame ->
+  {narrative_expr}
+  {mechanics_expr}
+  {assets_expr}
+  let balance = 0.75 in
+  manifest story mechanics assets balance"""
+
+        return final_expression
+
+    def _update_performance_metrics(self, generation_time: float, llm_responses: Dict[LLMType, LLMResponse]):
+        """Update performance tracking metrics."""
+        # Update average generation time
+        total_successful = self.generation_metrics["successful_requests"]
+        current_avg = self.generation_metrics["average_generation_time"]
+        new_avg = (current_avg * (total_successful - 1) + generation_time) / total_successful
+        self.generation_metrics["average_generation_time"] = new_avg
+
+        # Update LLM response times
+        for llm_type, response in llm_responses.items():
+            if response.response_time > 0:
+                self.generation_metrics["llm_response_times"][llm_type].append(response.response_time)
+                # Keep only last 100 response times per LLM
+                if len(self.generation_metrics["llm_response_times"][llm_type]) > 100:
+                    self.generation_metrics["llm_response_times"][llm_type].pop(0)
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get current performance metrics."""
+        return {
+            **self.generation_metrics,
+            "active_requests": len(self.active_requests),
+            "model_configs": {llm_type.value: asdict(model) for llm_type, model in self.models.items()}
         }
 
-        if result.responses:
-            total_llm_time = sum(r.execution_time for r in result.responses)
-            metrics['average_llm_time'] = total_llm_time / len(result.responses)
+    def get_active_requests(self) -> List[str]:
+        """Get list of active request IDs."""
+        return list(self.active_requests.keys())
 
-            for response in result.responses:
-                metrics['llm_times'][response.llm_type] = response.execution_time
+    async def cancel_request(self, request_id: str) -> bool:
+        """Cancel an active request."""
+        if request_id in self.active_requests:
+            # In a real implementation, you'd cancel the ongoing tasks
+            self.active_requests.pop(request_id, None)
+            logger.info(f"Cancelled request {request_id}")
+            return True
+        return False
 
-        return metrics
+
+# Singleton instance
+game_orchestrator = GameOrchestrator()
+
+
+async def generate_game_from_analysis(text_analysis: TextAnalysisResult, user_id: Optional[str] = None, parent_cid: Optional[str] = None) -> GameGenerationResult:
+    """
+    Generate a game from text analysis results.
+
+    Args:
+        text_analysis: Results from text orchestrator analysis
+        user_id: Optional user ID for tracking
+        parent_cid: Optional parent CID for evolution
+
+    Returns:
+        GameGenerationResult with final GΛLYPH expression
+    """
+    import uuid
+
+    request = GameGenerationRequest(
+        request_id=str(uuid.uuid4()),
+        text_analysis=text_analysis,
+        user_id=user_id,
+        parent_cid=parent_cid
+    )
+
+    return await game_orchestrator.generate_game(request)
