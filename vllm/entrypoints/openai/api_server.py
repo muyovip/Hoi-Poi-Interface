@@ -353,6 +353,10 @@ def translation(request: Request) -> OpenAIServingTranslation:
     return request.app.state.openai_serving_translation
 
 
+def game_server(request: Request):
+    return request.app.state.game_serving
+
+
 def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
 
