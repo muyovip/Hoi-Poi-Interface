@@ -171,7 +171,7 @@ jobs:
             --genesis-api "${{ env.GENESIS_API_URL }}"
       - name: Deploy to Vercel
         run: |
-          vercel --token ... --confirm --project capsuleos-3d-interface dist (add --project flag).
+          vercel --token "${{ secrets.VERCEL_TOKEN }}" --prod --confirm --project hoi-poi-interface dist
       - name: Register capsule in Genesis Graph
         run: |
           curl -X POST "${{ env.GENESIS_API_URL }}/genesis/capsules" \
