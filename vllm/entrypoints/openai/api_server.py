@@ -1950,6 +1950,15 @@ async def init_app_state(
         else None
     )
 
+    # Initialize game serving
+    try:
+        from vllm.entrypoints.openai.game_server import GameServing
+        state.game_serving = GameServing(engine_client, request_logger)
+        logger.info("Game generation service initialized")
+    except Exception as e:
+        logger.warning(f"Failed to initialize game serving service: {e}")
+        state.game_serving = None
+
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
 
