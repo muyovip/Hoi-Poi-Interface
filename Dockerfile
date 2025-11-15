@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose the port vLLM will run on
-EXPOSE 8000
+EXPOSE 8080
 
 # Start the vLLM server
 # NOTE: No commas between arguments, just spaces
